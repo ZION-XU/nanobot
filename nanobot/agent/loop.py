@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -139,10 +141,10 @@ class AgentLoop:
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a single inbound message.
-        
+
         Args:
             msg: The inbound message to process.
-        
+
         Returns:
             The response message, or None if no response needed.
         """
@@ -150,12 +152,27 @@ class AgentLoop:
         # The chat_id contains the original "channel:chat_id" to route back to
         if msg.channel == "system":
             return await self._process_system_message(msg)
-        
+
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}")
-        
+
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
-        
+
+        # === Claude Code Mode Handling ===
+        if session.claude_mode:
+            return await self._handle_claude_mode(msg, session)
+
+        # Check if user wants to enter Claude Code mode
+        enter_result = self._check_enter_claude_mode(msg.content, session)
+        if enter_result:
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=enter_result
+            )
+        # === End Claude Code Mode Handling ===
+
         # Update tool contexts
         message_tool = self.tools.get("message")
         if isinstance(message_tool, MessageTool):
@@ -363,3 +380,145 @@ class AgentLoop:
         
         response = await self._process_message(msg)
         return response.content if response else ""
+
+    # === Claude Code Mode Methods ===
+
+    def _check_enter_claude_mode(self, content: str, session) -> str | None:
+        """
+        Check if user wants to enter Claude Code mode.
+
+        Returns a welcome message if entering, None otherwise.
+        """
+        content_lower = content.lower().strip()
+
+        # Match patterns like:
+        # "进入 G:\projects\myapp 写代码"
+        # "enter G:\projects\myapp code mode"
+        # "claude code G:\projects\myapp"
+        # "在 /home/user/project 写代码"
+        patterns = [
+            r"(?:进入|enter|打开|open)\s+['\"]?([A-Za-z]:[\\\/][^\s'\"]+|\/[^\s'\"]+)['\"]?\s*(?:写代码|编程|code|coding)?",
+            r"(?:claude\s*code|cc)\s+['\"]?([A-Za-z]:[\\\/][^\s'\"]+|\/[^\s'\"]+)['\"]?",
+            r"(?:在|at|in)\s+['\"]?([A-Za-z]:[\\\/][^\s'\"]+|\/[^\s'\"]+)['\"]?\s*(?:写代码|编程|code|coding)",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, content, re.IGNORECASE)
+            if match:
+                working_dir = match.group(1).strip().strip("'\"")
+                path = Path(working_dir)
+
+                if not path.exists():
+                    return f"❌ 目录不存在: {working_dir}"
+                if not path.is_dir():
+                    return f"❌ 不是目录: {working_dir}"
+
+                session.claude_mode = True
+                session.claude_working_dir = str(path.resolve())
+                session.claude_session_id = None
+
+                return (
+                    f"✅ 已进入 Claude Code 模式\n"
+                    f"📁 工作目录: {session.claude_working_dir}\n\n"
+                    f"现在你发送的消息会直接传给 Claude Code 处理。\n"
+                    f"发送「退出」或「exit」退出此模式。"
+                )
+
+        return None
+
+    async def _handle_claude_mode(self, msg: InboundMessage, session) -> OutboundMessage:
+        """
+        Handle messages when in Claude Code mode.
+
+        Directly forwards messages to Claude Code CLI.
+        """
+        content = msg.content.strip()
+        content_lower = content.lower()
+
+        # Check for exit commands
+        exit_commands = ["退出", "exit", "quit", "退出claude", "exit claude", "q"]
+        if content_lower in exit_commands:
+            session.claude_mode = False
+            session.claude_working_dir = None
+            session.claude_session_id = None
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="✅ 已退出 Claude Code 模式，回到正常对话。"
+            )
+
+        # Build command - use shell mode for Windows PATH compatibility
+        cmd_parts = ["claude", "--print", "--dangerously-skip-permissions"]
+
+        # Use --resume if we have a session_id
+        if session.claude_session_id:
+            cmd_parts.extend(["--resume", session.claude_session_id])
+
+        cmd_str = " ".join(cmd_parts)
+
+        logger.info(f"Claude Code mode: executing in {session.claude_working_dir}")
+        logger.debug(f"Command: {cmd_str}")
+
+        try:
+            # Run Claude Code with shell=True for Windows PATH compatibility
+            process = await asyncio.create_subprocess_shell(
+                cmd_str,
+                cwd=session.claude_working_dir,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            # Pass content via stdin
+            stdout, stderr = await process.communicate(input=content.encode("utf-8"))
+
+            output = stdout.decode("utf-8", errors="replace")
+            error_output = stderr.decode("utf-8", errors="replace")
+
+            # Try to extract session_id from output for future --resume
+            # Claude Code may output session info in JSON format
+            if not session.claude_session_id and output:
+                session_match = re.search(r'"session_id"\s*:\s*"([^"]+)"', output)
+                if session_match:
+                    session.claude_session_id = session_match.group(1)
+                    logger.debug(f"Captured Claude session_id: {session.claude_session_id}")
+
+            # Save session state
+            session.add_message("user", f"[Claude Code] {content}")
+            session.add_message("assistant", output[:500] if output else "(无输出)")
+            self.sessions.save(session)
+
+            # Prepare response
+            if process.returncode != 0 and error_output:
+                result = f"⚠️ Claude Code 返回错误:\n```\n{error_output[:2000]}\n```"
+                if output:
+                    result += f"\n\n输出:\n{output[:3000]}"
+            elif output:
+                # Truncate very long output
+                if len(output) > 4000:
+                    result = output[:4000] + f"\n\n... (输出过长，已截断，共 {len(output)} 字符)"
+                else:
+                    result = output
+            else:
+                result = "(Claude Code 无输出)"
+
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=result
+            )
+
+        except FileNotFoundError:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="❌ 错误: 未找到 `claude` 命令。请确保已安装 Claude Code:\n`npm install -g @anthropic-ai/claude-code`"
+            )
+        except Exception as e:
+            logger.error(f"Claude Code execution error: {e}")
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"❌ 执行 Claude Code 时出错: {str(e)}"
+            )

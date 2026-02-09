@@ -15,15 +15,20 @@ from nanobot.utils.helpers import ensure_dir, safe_filename
 class Session:
     """
     A conversation session.
-    
+
     Stores messages in JSONL format for easy reading and persistence.
     """
-    
+
     key: str  # channel:chat_id
     messages: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    # Claude Code mode state
+    claude_mode: bool = False
+    claude_working_dir: str | None = None
+    claude_session_id: str | None = None
     
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -120,6 +125,10 @@ class SessionManager:
                     if data.get("_type") == "metadata":
                         metadata = data.get("metadata", {})
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
+                        # Store claude mode state in metadata for loading
+                        metadata["claude_mode"] = data.get("claude_mode", False)
+                        metadata["claude_working_dir"] = data.get("claude_working_dir")
+                        metadata["claude_session_id"] = data.get("claude_session_id")
                     else:
                         messages.append(data)
             
@@ -127,7 +136,10 @@ class SessionManager:
                 key=key,
                 messages=messages,
                 created_at=created_at or datetime.now(),
-                metadata=metadata
+                metadata=metadata,
+                claude_mode=metadata.get("claude_mode", False),
+                claude_working_dir=metadata.get("claude_working_dir"),
+                claude_session_id=metadata.get("claude_session_id"),
             )
         except Exception as e:
             logger.warning(f"Failed to load session {key}: {e}")
@@ -136,21 +148,24 @@ class SessionManager:
     def save(self, session: Session) -> None:
         """Save a session to disk."""
         path = self._get_session_path(session.key)
-        
+
         with open(path, "w") as f:
-            # Write metadata first
+            # Write metadata first (include claude mode state)
             metadata_line = {
                 "_type": "metadata",
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata
+                "metadata": session.metadata,
+                "claude_mode": session.claude_mode,
+                "claude_working_dir": session.claude_working_dir,
+                "claude_session_id": session.claude_session_id,
             }
             f.write(json.dumps(metadata_line) + "\n")
-            
+
             # Write messages
             for msg in session.messages:
                 f.write(json.dumps(msg) + "\n")
-        
+
         self._cache[session.key] = session
     
     def delete(self, key: str) -> bool:
