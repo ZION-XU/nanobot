@@ -191,12 +191,13 @@ class SkillsLoader:
         return self._parse_nanobot_metadata(meta.get("metadata", ""))
     
     def get_always_skills(self) -> list[str]:
-        """Get skills marked as always=true that meet requirements."""
+        """Get skills marked as always/alwaysLoad=true that meet requirements."""
         result = []
         for s in self.list_skills(filter_unavailable=True):
             meta = self.get_skill_metadata(s["name"]) or {}
             skill_meta = self._parse_nanobot_metadata(meta.get("metadata", ""))
-            if skill_meta.get("always") or meta.get("always"):
+            if (skill_meta.get("always") or meta.get("always")
+                    or meta.get("alwaysLoad") in ("true", "True", True)):
                 result.append(s["name"])
         return result
     

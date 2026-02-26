@@ -231,14 +231,35 @@ def gateway(
     cron.on_job = on_cron_job
     
     # Create heartbeat service
+    # 从 cron jobs 中获取默认飞书通知目标
+    _hb_notify_channel = "feishu"
+    _hb_notify_to = None
+    for _job in cron.list_jobs():
+        if _job.payload.deliver and _job.payload.channel == "feishu" and _job.payload.to:
+            _hb_notify_to = _job.payload.to
+            break
+    
     async def on_heartbeat(prompt: str) -> str:
         """Execute heartbeat through the agent."""
-        return await agent.process_direct(prompt, session_key="heartbeat")
+        response = await agent.process_direct(
+            prompt,
+            session_key=f"{_hb_notify_channel}:{_hb_notify_to}" if _hb_notify_to else "heartbeat",
+            channel=_hb_notify_channel,
+            chat_id=_hb_notify_to or "direct",
+        )
+        if _hb_notify_to and response:
+            from nanobot.bus.events import OutboundMessage
+            await bus.publish_outbound(OutboundMessage(
+                channel=_hb_notify_channel,
+                chat_id=_hb_notify_to,
+                content=response,
+            ))
+        return response
     
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
         on_heartbeat=on_heartbeat,
-        interval_s=30 * 60,  # 30 minutes
+        interval_s=24 * 60 * 60,  # 24 hours
         enabled=True
     )
     
@@ -254,7 +275,7 @@ def gateway(
     if cron_status["jobs"] > 0:
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
     
-    console.print(f"[green]✓[/green] Heartbeat: every 30m")
+    console.print(f"[green]✓[/green] Heartbeat: every 24h")
     
     async def run():
         try:

@@ -6,12 +6,14 @@ from typing import Any, Callable, Coroutine
 
 from loguru import logger
 
-# Default interval: 30 minutes
-DEFAULT_HEARTBEAT_INTERVAL_S = 30 * 60
+# Default interval: 24 hours
+DEFAULT_HEARTBEAT_INTERVAL_S = 24 * 60 * 60
 
 # The prompt sent to agent during heartbeat
 HEARTBEAT_PROMPT = """Read HEARTBEAT.md in your workspace (if it exists).
 Follow any instructions or tasks listed there.
+Use the exec tool to call APIs (e.g. curl), and the message tool to notify users.
+Read project configs from workspace/projects/*.yaml for project details.
 If nothing needs attention, reply with just: HEARTBEAT_OK"""
 
 # Token that indicates "nothing to do"
@@ -49,11 +51,13 @@ class HeartbeatService:
         on_heartbeat: Callable[[str], Coroutine[Any, Any, str]] | None = None,
         interval_s: int = DEFAULT_HEARTBEAT_INTERVAL_S,
         enabled: bool = True,
+        run_on_start: bool = True,
     ):
         self.workspace = workspace
         self.on_heartbeat = on_heartbeat
         self.interval_s = interval_s
         self.enabled = enabled
+        self.run_on_start = run_on_start
         self._running = False
         self._task: asyncio.Task | None = None
     
@@ -65,7 +69,7 @@ class HeartbeatService:
         """Read HEARTBEAT.md content."""
         if self.heartbeat_file.exists():
             try:
-                return self.heartbeat_file.read_text()
+                return self.heartbeat_file.read_text(encoding="utf-8")
             except Exception:
                 return None
         return None
@@ -75,10 +79,15 @@ class HeartbeatService:
         if not self.enabled:
             logger.info("Heartbeat disabled")
             return
-        
+
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
         logger.info(f"Heartbeat started (every {self.interval_s}s)")
+
+        # Run immediately on start if configured
+        if self.run_on_start:
+            logger.info("Heartbeat: running startup check...")
+            asyncio.create_task(self._tick())
     
     def stop(self) -> None:
         """Stop the heartbeat service."""

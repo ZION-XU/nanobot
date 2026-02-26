@@ -1,9 +1,6 @@
 """Agent loop: the core processing engine."""
 
 import asyncio
-import json
-import re
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +10,12 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.swarm import Agent, Swarm, SwarmResult
+from nanobot.agent.agents import (
+    create_triage_agent,
+    create_coder_agent,
+    create_searcher_agent,
+)
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
@@ -30,10 +33,9 @@ class AgentLoop:
     
     It:
     1. Receives messages from the bus
-    2. Builds context with history, memory, skills
-    3. Calls the LLM
-    4. Executes tool calls
-    5. Sends responses back
+    2. Routes to the active Swarm agent
+    3. Manages handoffs between agents
+    4. Sends responses back
     """
     
     def __init__(
@@ -72,7 +74,152 @@ class AgentLoop:
         
         self._running = False
         self._register_default_tools()
-    
+        
+        # Swarm engine
+        self.swarm = Swarm(provider=provider, default_model=self.model)
+        
+        # Agent registry
+        self._agents: dict[str, Agent] = {}
+        self._init_agents()
+
+    def _init_agents(self) -> None:
+        """Initialize all swarm agents with injected tool functions."""
+        # Create base agents
+        triage = create_triage_agent(context_builder=self.context)
+        coder = create_coder_agent()
+        searcher = create_searcher_agent()
+
+        # Inject shared tool functions into agents
+        shared_tools = self._create_shared_tool_functions()
+        triage.functions = list(triage.functions) + shared_tools
+        searcher.functions = list(searcher.functions) + self._create_search_tool_functions()
+
+        self._agents = {
+            "triage": triage,
+            "coder": coder,
+            "searcher": searcher,
+        }
+
+    def _create_shared_tool_functions(self) -> list:
+        """Create shared tool functions from the ToolRegistry.
+        
+        Wraps existing Tool instances as plain Python functions
+        so they can be used by the Swarm engine.
+        """
+        functions = []
+
+        # read_file
+        read_tool = self.tools.get("read_file")
+        if read_tool:
+            async def read_file(path: str) -> str:
+                """读取文件内容。"""
+                return await self.tools.execute("read_file", {"path": path})
+            functions.append(read_file)
+
+        # write_file
+        write_tool = self.tools.get("write_file")
+        if write_tool:
+            async def write_file(path: str, content: str) -> str:
+                """写入文件内容。"""
+                return await self.tools.execute("write_file", {"path": path, "content": content})
+            functions.append(write_file)
+
+        # edit_file
+        edit_tool = self.tools.get("edit_file")
+        if edit_tool:
+            async def edit_file(path: str, old_text: str, new_text: str) -> str:
+                """编辑文件，替换指定文本。"""
+                return await self.tools.execute("edit_file", {"path": path, "old_text": old_text, "new_text": new_text})
+            functions.append(edit_file)
+
+        # list_dir
+        list_tool = self.tools.get("list_dir")
+        if list_tool:
+            async def list_dir(path: str) -> str:
+                """列出目录内容。"""
+                return await self.tools.execute("list_dir", {"path": path})
+            functions.append(list_dir)
+
+        # exec
+        exec_tool = self.tools.get("exec")
+        if exec_tool:
+            async def exec(command: str) -> str:
+                """执行 shell 命令。"""
+                return await self.tools.execute("exec", {"command": command})
+            functions.append(exec)
+
+        # message
+        msg_tool = self.tools.get("message")
+        if msg_tool:
+            async def message(content: str, channel: str, to: str) -> str:
+                """发送消息给用户（通过指定渠道）。"""
+                return await self.tools.execute("message", {"content": content, "channel": channel, "to": to})
+            functions.append(message)
+
+        # spawn
+        spawn_tool = self.tools.get("spawn")
+        if spawn_tool:
+            async def spawn(task: str, label: str = "") -> str:
+                """在后台启动一个 subagent 执行独立任务。"""
+                params: dict[str, Any] = {"task": task}
+                if label:
+                    params["label"] = label
+                return await self.tools.execute("spawn", params)
+            functions.append(spawn)
+
+        # cron
+        cron_tool = self.tools.get("cron")
+        if cron_tool:
+            async def cron(action: str, name: str = "", message: str = "", schedule: str = "", job_id: str = "", deliver: bool = False, channel: str = "", to: str = "") -> str:
+                """管理定时任务。action: add/list/remove/enable/disable"""
+                params: dict[str, Any] = {"action": action}
+                if name:
+                    params["name"] = name
+                if message:
+                    params["message"] = message
+                if schedule:
+                    params["schedule"] = schedule
+                if job_id:
+                    params["job_id"] = job_id
+                if deliver:
+                    params["deliver"] = deliver
+                if channel:
+                    params["channel"] = channel
+                if to:
+                    params["to"] = to
+                return await self.tools.execute("cron", params)
+            functions.append(cron)
+
+        return functions
+
+    def _create_search_tool_functions(self) -> list:
+        """Create search-specific tool functions for the searcher agent."""
+        functions = []
+
+        search_tool = self.tools.get("web_search")
+        if search_tool:
+            async def web_search(query: str) -> str:
+                """搜索网络信息。"""
+                return await self.tools.execute("web_search", {"query": query})
+            functions.append(web_search)
+
+        fetch_tool = self.tools.get("web_fetch")
+        if fetch_tool:
+            async def web_fetch(url: str) -> str:
+                """获取网页内容。"""
+                return await self.tools.execute("web_fetch", {"url": url})
+            functions.append(web_fetch)
+
+        # Also give searcher read_file
+        read_tool = self.tools.get("read_file")
+        if read_tool:
+            async def read_file(path: str) -> str:
+                """读取文件内容。"""
+                return await self.tools.execute("read_file", {"path": path})
+            functions.append(read_file)
+
+        return functions
+
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         # File tools
@@ -140,16 +287,12 @@ class AgentLoop:
     
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
-        Process a single inbound message.
+        Process a single inbound message via the Swarm engine.
 
-        Args:
-            msg: The inbound message to process.
-
-        Returns:
-            The response message, or None if no response needed.
+        The active agent is restored from the session so that
+        multi-turn handoff state is preserved.
         """
         # Handle system messages (subagent announces)
-        # The chat_id contains the original "channel:chat_id" to route back to
         if msg.channel == "system":
             return await self._process_system_message(msg)
 
@@ -158,96 +301,61 @@ class AgentLoop:
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
 
-        # === Claude Code Mode Handling ===
-        if session.claude_mode:
-            return await self._handle_claude_mode(msg, session)
+        # Update tool contexts (message, spawn, cron need channel/chat_id)
+        self._update_tool_contexts(msg.channel, msg.chat_id)
 
-        # Check if user wants to enter Claude Code mode
-        enter_result = self._check_enter_claude_mode(msg.content, session)
-        if enter_result:
-            self.sessions.save(session)
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=enter_result
-            )
-        # === End Claude Code Mode Handling ===
+        # Determine active agent (restore from session or default to triage)
+        active_agent_name = session.metadata.get("active_agent", "triage")
+        agent = self._agents.get(active_agent_name, self._agents["triage"])
 
-        # Update tool contexts
-        message_tool = self.tools.get("message")
-        if isinstance(message_tool, MessageTool):
-            message_tool.set_context(msg.channel, msg.chat_id)
-        
-        spawn_tool = self.tools.get("spawn")
-        if isinstance(spawn_tool, SpawnTool):
-            spawn_tool.set_context(msg.channel, msg.chat_id)
-        
-        cron_tool = self.tools.get("cron")
-        if isinstance(cron_tool, CronTool):
-            cron_tool.set_context(msg.channel, msg.chat_id)
-        
-        # Build initial messages (use get_history for LLM-formatted messages)
-        messages = self.context.build_messages(
-            history=session.get_history(),
-            current_message=msg.content,
-            media=msg.media if msg.media else None,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
+        # Build context variables
+        ctx = session.metadata.get("context_variables", {})
+        ctx.update({
+            "channel": msg.channel,
+            "chat_id": msg.chat_id,
+            "sender_id": msg.sender_id,
+        })
+
+        # Build messages from history
+        history = session.get_history()
+        history.append({"role": "user", "content": msg.content})
+
+        # Run Swarm
+        result = await self.swarm.run(
+            agent=agent,
+            messages=history,
+            context_variables=ctx,
+            max_turns=self.max_iterations,
         )
-        
-        # Agent loop
-        iteration = 0
+
+        # Extract final response
         final_content = None
+        for m in reversed(result.messages):
+            if m.get("role") == "assistant" and m.get("content"):
+                # Skip messages that are just tool-call wrappers
+                if not m.get("tool_calls"):
+                    final_content = m["content"]
+                    break
         
-        while iteration < self.max_iterations:
-            iteration += 1
-            
-            # Call LLM
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model
-            )
-            
-            # Handle tool calls
-            if response.has_tool_calls:
-                # Add assistant message with tool calls
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)  # Must be JSON string
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts
-                )
-                
-                # Execute tools
-                for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments)
-                    logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
-            else:
-                # No tool calls, we're done
-                final_content = response.content
-                break
-        
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
-        
-        # Save to session
+        if not final_content:
+            # Fallback: look for any assistant content
+            for m in reversed(result.messages):
+                if m.get("role") == "assistant" and m.get("content"):
+                    final_content = m["content"]
+                    break
+
+        if not final_content:
+            final_content = "任务已完成。"
+
+        # Persist agent state and context
+        session.metadata["active_agent"] = result.agent.name if result.agent else "triage"
+        session.metadata["context_variables"] = result.context_variables
+
+        # Save conversation to session
         session.add_message("user", msg.content)
         session.add_message("assistant", final_content)
         self.sessions.save(session)
-        
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -269,7 +377,6 @@ class AgentLoop:
             origin_channel = parts[0]
             origin_chat_id = parts[1]
         else:
-            # Fallback
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
         
@@ -278,72 +385,41 @@ class AgentLoop:
         session = self.sessions.get_or_create(session_key)
         
         # Update tool contexts
-        message_tool = self.tools.get("message")
-        if isinstance(message_tool, MessageTool):
-            message_tool.set_context(origin_channel, origin_chat_id)
+        self._update_tool_contexts(origin_channel, origin_chat_id)
         
-        spawn_tool = self.tools.get("spawn")
-        if isinstance(spawn_tool, SpawnTool):
-            spawn_tool.set_context(origin_channel, origin_chat_id)
-        
-        cron_tool = self.tools.get("cron")
-        if isinstance(cron_tool, CronTool):
-            cron_tool.set_context(origin_channel, origin_chat_id)
-        
-        # Build messages with the announce content
-        messages = self.context.build_messages(
-            history=session.get_history(),
-            current_message=msg.content,
-            channel=origin_channel,
-            chat_id=origin_chat_id,
+        # Use triage agent for system messages
+        agent = self._agents["triage"]
+
+        ctx = session.metadata.get("context_variables", {})
+        ctx.update({
+            "channel": origin_channel,
+            "chat_id": origin_chat_id,
+        })
+
+        history = session.get_history()
+        history.append({"role": "user", "content": msg.content})
+
+        result = await self.swarm.run(
+            agent=agent,
+            messages=history,
+            context_variables=ctx,
+            max_turns=self.max_iterations,
         )
-        
-        # Agent loop (limited for announce handling)
-        iteration = 0
+
+        # Extract final response
         final_content = None
-        
-        while iteration < self.max_iterations:
-            iteration += 1
-            
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model
-            )
-            
-            if response.has_tool_calls:
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts
-                )
-                
-                for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments)
-                    logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
-            else:
-                final_content = response.content
+        for m in reversed(result.messages):
+            if m.get("role") == "assistant" and m.get("content") and not m.get("tool_calls"):
+                final_content = m["content"]
                 break
-        
-        if final_content is None:
-            final_content = "Background task completed."
-        
-        # Save to session (mark as system message in history)
+
+        if not final_content:
+            final_content = "后台任务已完成。"
+
+        # Save to session
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
         session.add_message("assistant", final_content)
+        session.metadata["context_variables"] = result.context_variables
         self.sessions.save(session)
         
         return OutboundMessage(
@@ -360,16 +436,9 @@ class AgentLoop:
         chat_id: str = "direct",
     ) -> str:
         """
-        Process a message directly (for CLI or cron usage).
+        Process a message directly (for CLI, cron, or heartbeat usage).
         
-        Args:
-            content: The message content.
-            session_key: Session identifier.
-            channel: Source channel (for context).
-            chat_id: Source chat ID (for context).
-        
-        Returns:
-            The agent's response.
+        Routes through the Swarm engine just like regular messages.
         """
         msg = InboundMessage(
             channel=channel,
@@ -381,155 +450,16 @@ class AgentLoop:
         response = await self._process_message(msg)
         return response.content if response else ""
 
-    # === Claude Code Mode Methods ===
-
-    def _check_enter_claude_mode(self, content: str, session) -> str | None:
-        """
-        Check if user wants to enter Claude Code mode.
-
-        Returns a welcome message if entering, None otherwise.
-        """
-        content_lower = content.lower().strip()
-
-        # Match patterns like:
-        # "进入 G:\projects\myapp 写代码"
-        # "enter G:\projects\myapp code mode"
-        # "claude code G:\projects\myapp"
-        # "在 /home/user/project 写代码"
-        patterns = [
-            r"(?:进入|enter|打开|open)\s+['\"]?([A-Za-z]:[\\\/][^\s'\"]+|\/[^\s'\"]+)['\"]?\s*(?:写代码|编程|code|coding)?",
-            r"(?:claude\s*code|cc)\s+['\"]?([A-Za-z]:[\\\/][^\s'\"]+|\/[^\s'\"]+)['\"]?",
-            r"(?:在|at|in)\s+['\"]?([A-Za-z]:[\\\/][^\s'\"]+|\/[^\s'\"]+)['\"]?\s*(?:写代码|编程|code|coding)",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, content, re.IGNORECASE)
-            if match:
-                working_dir = match.group(1).strip().strip("'\"")
-                path = Path(working_dir)
-
-                if not path.exists():
-                    return f"❌ 目录不存在: {working_dir}"
-                if not path.is_dir():
-                    return f"❌ 不是目录: {working_dir}"
-
-                session.claude_mode = True
-                session.claude_working_dir = str(path.resolve())
-                session.claude_session_id = None
-
-                return (
-                    f"✅ 已进入 Claude Code 模式\n"
-                    f"📁 工作目录: {session.claude_working_dir}\n\n"
-                    f"现在你发送的消息会直接传给 Claude Code 处理。\n"
-                    f"发送「退出」或「exit」退出此模式。"
-                )
-
-        return None
-
-    async def _handle_claude_mode(self, msg: InboundMessage, session) -> OutboundMessage:
-        """
-        Handle messages when in Claude Code mode.
-
-        Directly forwards messages to Claude Code CLI.
-        """
-        content = msg.content.strip()
-        content_lower = content.lower()
-
-        # Check for exit commands
-        exit_commands = ["退出", "exit", "quit", "退出claude", "exit claude", "q"]
-        if content_lower in exit_commands:
-            session.claude_mode = False
-            session.claude_working_dir = None
-            session.claude_session_id = None
-            self.sessions.save(session)
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="✅ 已退出 Claude Code 模式，回到正常对话。"
-            )
-
-        # Build command - use shell mode for Windows PATH compatibility
-        # Use --output-format json to get session_id for continuity
-        cmd_parts = ["claude", "--print", "--dangerously-skip-permissions", "--output-format", "json"]
-
-        # Use --resume if we have a session_id (for conversation continuity)
-        if session.claude_session_id:
-            cmd_parts.extend(["--resume", session.claude_session_id])
-
-        cmd_str = " ".join(cmd_parts)
-
-        logger.info(f"Claude Code mode: executing in {session.claude_working_dir}")
-        logger.debug(f"Command: {cmd_str}")
-
-        try:
-            # Run Claude Code with shell=True for Windows PATH compatibility
-            process = await asyncio.create_subprocess_shell(
-                cmd_str,
-                cwd=session.claude_working_dir,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            # Pass content via stdin
-            stdout, stderr = await process.communicate(input=content.encode("utf-8"))
-
-            output = stdout.decode("utf-8", errors="replace")
-            error_output = stderr.decode("utf-8", errors="replace")
-
-            # Parse JSON output to extract session_id and result
-            display_text = output
-            try:
-                if output.strip():
-                    json_output = json.loads(output)
-                    # Extract session_id for conversation continuity
-                    if "session_id" in json_output:
-                        session.claude_session_id = json_output["session_id"]
-                        logger.debug(f"Captured Claude session_id: {session.claude_session_id}")
-                    # Extract the actual response text
-                    if "result" in json_output:
-                        display_text = json_output["result"]
-                    elif "content" in json_output:
-                        display_text = json_output["content"]
-            except json.JSONDecodeError:
-                # Not JSON, use raw output (fallback for older claude versions)
-                logger.debug("Claude output is not JSON, using raw output")
-
-            # Save session state
-            session.add_message("user", f"[Claude Code] {content}")
-            session.add_message("assistant", display_text[:500] if display_text else "(无输出)")
-            self.sessions.save(session)
-
-            # Prepare response
-            if process.returncode != 0 and error_output:
-                result = f"⚠️ Claude Code 返回错误:\n```\n{error_output[:2000]}\n```"
-                if display_text:
-                    result += f"\n\n输出:\n{display_text[:3000]}"
-            elif display_text:
-                # Truncate very long output
-                if len(display_text) > 4000:
-                    result = display_text[:4000] + f"\n\n... (输出过长，已截断，共 {len(display_text)} 字符)"
-                else:
-                    result = display_text
-            else:
-                result = "(Claude Code 无输出)"
-
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=result
-            )
-
-        except FileNotFoundError:
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="❌ 错误: 未找到 `claude` 命令。请确保已安装 Claude Code:\n`npm install -g @anthropic-ai/claude-code`"
-            )
-        except Exception as e:
-            logger.error(f"Claude Code execution error: {e}")
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=f"❌ 执行 Claude Code 时出错: {str(e)}"
-            )
+    def _update_tool_contexts(self, channel: str, chat_id: str) -> None:
+        """Update channel/chat_id context on tools that need it."""
+        message_tool = self.tools.get("message")
+        if isinstance(message_tool, MessageTool):
+            message_tool.set_context(channel, chat_id)
+        
+        spawn_tool = self.tools.get("spawn")
+        if isinstance(spawn_tool, SpawnTool):
+            spawn_tool.set_context(channel, chat_id)
+        
+        cron_tool = self.tools.get("cron")
+        if isinstance(cron_tool, CronTool):
+            cron_tool.set_context(channel, chat_id)

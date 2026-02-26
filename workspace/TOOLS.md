@@ -142,6 +142,31 @@ write_file(
 
 ---
 
+## Code Development (Claude Code)
+
+### claude_code
+调用 Claude Code 在指定项目目录中执行编码任务。
+```
+claude_code(task: str, working_dir: str) -> str
+```
+
+**⚠️ 重要规则：当需要修改代码文件时，必须使用 `claude_code` 工具，禁止使用 `exec`、`write_file`、`edit_file` 直接修改源代码文件。**
+
+适用场景：
+- 修复 BUG
+- 实现新功能
+- 重构代码
+- 代码审查和优化
+
+Claude Code 会自动分析项目结构、修改代码。完成后可用 `exec` 执行构建和部署命令。
+
+**使用流程：**
+1. 先用 `read_file` / `list_dir` / `exec` 了解项目结构和问题
+2. 用 `claude_code` 执行代码修改任务（task 描述要详细）
+3. 用 `exec` 执行构建、测试、部署等命令
+
+---
+
 ## Adding Custom Tools
 
 To add custom tools:
