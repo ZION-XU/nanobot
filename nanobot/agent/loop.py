@@ -27,7 +27,7 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig
+    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, SwarmConfig
     from nanobot.cron.service import CronService
 
 
@@ -62,6 +62,7 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        swarm_config: SwarmConfig | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -78,7 +79,10 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
 
-        self.context = ContextBuilder(workspace)
+        self.context = ContextBuilder(
+            workspace,
+            swarm_enabled=bool(swarm_config and swarm_config.enabled),
+        )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
@@ -103,6 +107,7 @@ class AgentLoop:
         self._consolidation_locks: dict[str, asyncio.Lock] = {}
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
+        self._swarm_config = swarm_config
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -122,6 +127,39 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+        # Register Jarvis swarm tool if enabled
+        if self._swarm_config and self._swarm_config.enabled:
+            self._register_swarm_tool()
+
+    def _register_swarm_tool(self) -> None:
+        """Initialize and register the Jarvis swarm tool."""
+        from nanobot.jarvis.roles import RoleRegistry
+        from nanobot.jarvis.pool import AgentPool
+        from nanobot.jarvis.orchestrator import Orchestrator
+        from nanobot.jarvis.tool import SwarmTool
+
+        role_registry = RoleRegistry()
+        agent_pool = AgentPool(
+            provider=self.provider,
+            workspace=self.workspace,
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            brave_api_key=self.brave_api_key,
+            exec_config=self.exec_config,
+            restrict_to_workspace=self.restrict_to_workspace,
+        )
+        orchestrator = Orchestrator(
+            provider=self.provider,
+            workspace=self.workspace,
+            role_registry=role_registry,
+            agent_pool=agent_pool,
+            model=self.model,
+            max_tokens=self.max_tokens,
+        )
+        self.tools.register(SwarmTool(orchestrator))
+        logger.info("Jarvis swarm tool registered with {} roles: {}",
+                     len(role_registry.list_roles()), ", ".join(role_registry.list_roles()))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -147,7 +185,7 @@ class AgentLoop:
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
+        for name in ("message", "spawn", "cron", "swarm"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))

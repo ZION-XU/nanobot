@@ -1,0 +1,10 @@
+name: writer
+display_name: "Technical Writer"
+max_iterations: 15
+tools:
+  - file_read
+  - file_write
+  - file_edit
+  - web_fetch
+can_delegate_to:
+prompt: writer.md

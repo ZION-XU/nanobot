@@ -1,0 +1,10 @@
+name: devops
+display_name: "DevOps Engineer"
+max_iterations: 20
+tools:
+  - shell
+  - file_read
+  - file_write
+  - list_dir
+can_delegate_to:
+prompt: devops.md

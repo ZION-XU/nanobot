@@ -1,0 +1,12 @@
+name: qa
+display_name: "QA Engineer"
+max_iterations: 20
+tools:
+  - shell
+  - file_read
+  - file_write
+  - list_dir
+  - web_fetch
+  - web_search
+can_delegate_to:
+prompt: qa.md

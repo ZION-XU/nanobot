@@ -14,14 +14,15 @@ from nanobot.agent.skills import SkillsLoader
 
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
-    
+
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
-    
-    def __init__(self, workspace: Path):
+
+    def __init__(self, workspace: Path, swarm_enabled: bool = False):
         self.workspace = workspace
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
+        self.swarm_enabled = swarm_enabled
     
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
@@ -58,6 +59,28 @@ Skills with available="false" need dependencies installed first - you can try in
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
         
+        swarm_hint = ""
+        if self.swarm_enabled:
+            swarm_hint = """
+
+## Agent Swarm
+You have a `swarm` tool that delegates ops and maintenance tasks to a team of specialized AI agents:
+- **coder**: fixes bugs, applies patches, modifies configs, adds small features (uses Claude Code)
+- **devops**: git operations, builds, deployments, releases, server management
+- **qa**: reviews code changes, runs tests, scans diffs for security issues
+- **researcher**: investigates errors, researches dependencies, checks CVEs, looks up docs
+- **writer**: writes changelogs, release notes, incident reports, status updates
+
+**IMPORTANT: When a user's request involves multiple steps or distinct domains (e.g. investigate then fix, fix then release, write notes then publish), you MUST use the `swarm` tool to delegate the task.** The swarm will plan, sequence, and coordinate agents automatically.
+
+Examples of when to use swarm:
+- "修一下这个bug" → swarm (coder)
+- "发布新版本" → swarm (devops)
+- "检查代码质量" → swarm (qa)
+- "查一下这个错误的原因然后修复" → swarm (researcher → coder)
+- "写个changelog然后发版" → swarm (writer → devops)
+- Simple single-step tasks (just chat, just read a file, just run a command) → do it yourself"""
+
         return f"""# nanobot 🐈
 
 You are nanobot, a helpful AI assistant.
@@ -77,7 +100,7 @@ Your workspace is at: {workspace_path}
 - After writing or editing a file, re-read it if accuracy matters.
 - If a tool call fails, analyze the error before retrying with a different approach.
 - Ask for clarification when the request is ambiguous.
-
+{swarm_hint}
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel."""
 
     @staticmethod

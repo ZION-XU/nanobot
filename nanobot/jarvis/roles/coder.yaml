@@ -1,0 +1,13 @@
+name: coder
+display_name: "Code Maintainer"
+max_iterations: 1
+use_claude_code: true
+tools:
+  - shell
+  - file_read
+  - file_write
+  - file_edit
+  - list_dir
+can_delegate_to:
+  - qa
+prompt: coder.md

@@ -1,0 +1,13 @@
+name: orchestrator
+display_name: "Orchestrator (CEO)"
+max_iterations: 10
+tools:
+  - web_search
+  - web_fetch
+  - file_read
+can_delegate_to:
+  - researcher
+  - coder
+  - qa
+  - writer
+prompt: orchestrator.md

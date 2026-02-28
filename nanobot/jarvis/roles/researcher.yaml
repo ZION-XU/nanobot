@@ -1,0 +1,10 @@
+name: researcher
+display_name: "Research Analyst"
+max_iterations: 20
+tools:
+  - web_search
+  - web_fetch
+  - file_read
+  - file_write
+can_delegate_to:
+prompt: researcher.md
